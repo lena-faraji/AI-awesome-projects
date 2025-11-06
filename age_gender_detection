@@ -4,261 +4,712 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn import metrics
 from sklearn.metrics import confusion_matrix, classification_report
 from sklearn.utils.class_weight import compute_class_weight
+from sklearn.preprocessing import LabelEncoder
+import json
+import yaml
+from typing import Tuple, Dict, List, Optional, Union
+import argparse
+from pathlib import Path
+import logging
+from datetime import datetime
 
 import tensorflow as tf
-from tensorflow.keras.models import Sequential, Model
-from tensorflow.keras.layers import (Conv2D, MaxPool2D, Dense, Dropout, 
-                                    BatchNormalization, Flatten, Input,
-                                    GlobalAveragePooling2D, concatenate)
-from tensorflow.keras.applications import EfficientNetB0
-from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import (Dense, Dropout, BatchNormalization, 
+                                    Input, GlobalAveragePooling2D, 
+                                    concatenate, Layer)
+from tensorflow.keras.applications import EfficientNetB0, EfficientNetB3
+from tensorflow.keras.optimizers import Adam, RMSprop
 from tensorflow.keras.callbacks import (ModelCheckpoint, EarlyStopping, 
-                                       ReduceLROnPlateau, TensorBoard)
+                                       ReduceLROnPlateau, TensorBoard,
+                                       LearningRateScheduler, CSVLogger)
 from tensorflow.keras.regularizers import l2
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras.utils import to_categorical
+from tensorflow.keras.mixed_precision import Policy
 
-# Constants
-IMG_SIZE = (200, 200)
-BATCH_SIZE = 64
-EPOCHS = 100
-PATIENCE = 10
-LEARNING_RATE = 0.001
-NUM_CLASSES_GENDER = 2
-NUM_CLASSES_AGE = 10  # For age classification (binned into 10 groups)
+# Mixed precision for better performance
+policy = Policy('mixed_float16')
+tf.keras.mixed_precision.set_global_policy(policy)
 
-class DataProcessor:
-    def __init__(self, path):
-        self.path = path
+class Config:
+    """Configuration class for all hyperparameters"""
+    def __init__(self):
+        self.IMG_SIZE = (224, 224)  # EfficientNet optimal size
+        self.BATCH_SIZE = 32
+        self.EPOCHS = 100
+        self.PATIENCE = 15
+        self.LEARNING_RATE = 0.001
+        self.NUM_CLASSES_AGE = 10
+        self.VALIDATION_SPLIT = 0.2
+        self.USE_MULTI_GPU = True
+        self.NUM_FOLDS = 5
+        self.AUGMENTATION_FACTOR = 2
+        self.MODEL_TYPE = 'efficientnet_b3'  # 'efficientnet_b0', 'efficientnet_b3', 'custom'
+        
+    def to_dict(self):
+        return {k: v for k, v in self.__dict__.items() if not k.startswith('_')}
+
+class AdvancedDataProcessor:
+    """Enhanced data processor with caching and advanced augmentation"""
+    
+    def __init__(self, config: Config):
+        self.config = config
         self.images = []
         self.ages = []
         self.genders = []
+        self.ethnicities = []  # Additional attribute
+        self.cache_dir = Path('./data_cache')
+        self.cache_dir.mkdir(exist_ok=True)
         
-    def load_data(self):
-        """Load and preprocess images from the dataset"""
-        for img_name in os.listdir(self.path):
-            try:
-                # Parse age and gender from filename
-                age = int(img_name.split("_")[0])
-                gender = int(img_name.split("_")[1])
-                
-                # Read and preprocess image
-                img = cv2.imread(os.path.join(self.path, img_name))
-                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                img = cv2.resize(img, IMG_SIZE)
-                
-                self.images.append(img)
-                self.ages.append(age)
-                self.genders.append(gender)
-            except Exception as e:
-                print(f"Skipping {img_name}: {str(e)}")
-                
-        # Convert to numpy arrays and normalize images
-        self.images = np.array(self.images, dtype=np.float32) / 255.0
-        self.ages = np.array(self.ages)
-        self.genders = np.array(self.genders)
+    def load_data(self, path: str, use_cache: bool = True) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Load and preprocess data with caching support"""
+        cache_file = self.cache_dir / 'processed_data.npz'
         
+        if use_cache and cache_file.exists():
+            logging.info("Loading cached data...")
+            data = np.load(cache_file)
+            self.images = data['images']
+            self.ages = data['ages']
+            self.genders = data['genders']
+            return self.images, self.ages, self.genders
+        
+        logging.info("Processing data from scratch...")
+        image_data = []
+        age_data = []
+        gender_data = []
+        ethnicity_data = []
+        
+        valid_extensions = {'.jpg', '.jpeg', '.png', '.bmp'}
+        
+        for img_path in Path(path).rglob('*'):
+            if img_path.suffix.lower() in valid_extensions:
+                try:
+                    # Parse filename: age_gender_race_date.jpg
+                    filename = img_path.stem
+                    parts = filename.split('_')
+                    
+                    if len(parts) >= 3:
+                        age = int(parts[0])
+                        gender = int(parts[1])
+                        ethnicity = int(parts[2]) if len(parts) > 2 else 0
+                        
+                        # Read and preprocess image
+                        img = cv2.imread(str(img_path))
+                        if img is not None:
+                            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                            img = cv2.resize(img, self.config.IMG_SIZE)
+                            
+                            # Advanced preprocessing
+                            img = self._advanced_preprocessing(img)
+                            
+                            image_data.append(img)
+                            age_data.append(age)
+                            gender_data.append(gender)
+                            ethnicity_data.append(ethnicity)
+                            
+                except Exception as e:
+                    logging.warning(f"Skipping {img_path}: {str(e)}")
+                    continue
+        
+        # Convert to numpy arrays
+        self.images = np.array(image_data, dtype=np.float32) / 255.0
+        self.ages = np.array(age_data)
+        self.genders = np.array(gender_data)
+        self.ethnicities = np.array(ethnicity_data)
+        
+        # Cache the processed data
+        if use_cache:
+            np.savez(cache_file, 
+                    images=self.images, 
+                    ages=self.ages, 
+                    genders=self.genders,
+                    ethnicities=self.ethnicities)
+        
+        logging.info(f"Loaded {len(self.images)} images")
         return self.images, self.ages, self.genders
     
-    def create_age_bins(self, num_bins=NUM_CLASSES_AGE):
-        """Convert continuous age to binned categories"""
-        bins = np.linspace(self.ages.min(), self.ages.max(), num_bins+1)
-        age_labels = np.digitize(self.ages, bins[:-1]) - 1
-        return to_categorical(age_labels, num_classes=num_bins)
+    def _advanced_preprocessing(self, img: np.ndarray) -> np.ndarray:
+        """Apply advanced preprocessing techniques"""
+        # Contrast Limited Adaptive Histogram Equalization (CLAHE)
+        lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
+        lab_planes = list(cv2.split(lab))
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        lab_planes[0] = clahe.apply(lab_planes[0])
+        lab = cv2.merge(lab_planes)
+        img = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+        
+        # Gaussian blur for noise reduction
+        img = cv2.GaussianBlur(img, (3, 3), 0)
+        
+        return img
     
-    def augment_data(self):
-        """Create image data generator with augmentation"""
-        return ImageDataGenerator(
-            rotation_range=20,
-            width_shift_range=0.2,
-            height_shift_range=0.2,
-            shear_range=0.2,
-            zoom_range=0.2,
-            horizontal_flip=True,
-            fill_mode='nearest'
-        )
-
-class MultiTaskModel:
-    def __init__(self, input_shape):
-        self.input_shape = input_shape
-        
-    def build_base_model(self):
-        """Build shared feature extraction layers"""
-        inputs = Input(shape=self.input_shape)
-        
-        # EfficientNet backbone (pretrained on ImageNet)
-        base_model = EfficientNetB0(
-            include_top=False,
-            weights='imagenet',
-            input_tensor=inputs,
-            pooling='max'
-        )
-        
-        # Fine-tune from this layer onwards
-        for layer in base_model.layers[:100]:
-            layer.trainable = False
+    def create_age_bins(self, strategy: str = 'quantile') -> np.ndarray:
+        """Create age bins with different strategies"""
+        if strategy == 'uniform':
+            bins = np.linspace(self.ages.min(), self.ages.max(), self.config.NUM_CLASSES_AGE + 1)
+        elif strategy == 'quantile':
+            bins = np.quantile(self.ages, np.linspace(0, 1, self.config.NUM_CLASSES_AGE + 1))
+        else:
+            raise ValueError("Strategy must be 'uniform' or 'quantile'")
             
+        age_labels = np.digitize(self.ages, bins[:-1]) - 1
+        return to_categorical(age_labels, num_classes=self.config.NUM_CLASSES_AGE)
+    
+    def get_advanced_augmentation(self) -> ImageDataGenerator:
+        """Create advanced data augmentation pipeline"""
+        return ImageDataGenerator(
+            rotation_range=25,
+            width_shift_range=0.3,
+            height_shift_range=0.3,
+            shear_range=0.3,
+            zoom_range=0.3,
+            horizontal_flip=True,
+            vertical_flip=False,
+            brightness_range=[0.7, 1.3],
+            channel_shift_range=0.2,
+            fill_mode='reflect',
+            data_format='channels_last'
+        )
+    
+    def analyze_dataset(self) -> Dict:
+        """Perform comprehensive dataset analysis"""
+        analysis = {
+            'total_samples': len(self.images),
+            'age_stats': {
+                'min': self.ages.min(),
+                'max': self.ages.max(),
+                'mean': self.ages.mean(),
+                'std': self.ages.std()
+            },
+            'gender_distribution': np.bincount(self.genders),
+            'ethnicity_distribution': np.bincount(self.ethnicities) if hasattr(self, 'ethnicities') else None
+        }
+        return analysis
+
+class AttentionModule(Layer):
+    """CBAM: Convolutional Block Attention Module"""
+    def __init__(self, ratio=8, **kwargs):
+        super(AttentionModule, self).__init__(**kwargs)
+        self.ratio = ratio
+        
+    def build(self, input_shape):
+        self.channel = input_shape[-1]
+        
+        # Channel attention
+        self.channel_dense1 = Dense(self.channel // self.ratio, activation='relu')
+        self.channel_dense2 = Dense(self.channel)
+        
+        # Spatial attention
+        self.spatial_conv = tf.keras.layers.Conv2D(1, 7, padding='same', activation='sigmoid')
+        
+        super(AttentionModule, self).build(input_shape)
+    
+    def call(self, inputs):
+        # Channel attention
+        channel_avg = tf.reduce_mean(inputs, axis=[1, 2], keepdims=True)
+        channel_max = tf.reduce_max(inputs, axis=[1, 2], keepdims=True)
+        
+        channel_avg = self.channel_dense1(channel_avg)
+        channel_avg = self.channel_dense2(channel_avg)
+        
+        channel_max = self.channel_dense1(channel_max)
+        channel_max = self.channel_dense2(channel_max)
+        
+        channel_attention = tf.sigmoid(channel_avg + channel_max)
+        x = inputs * channel_attention
+        
+        # Spatial attention
+        spatial_avg = tf.reduce_mean(x, axis=-1, keepdims=True)
+        spatial_max = tf.reduce_max(x, axis=-1, keepdims=True)
+        spatial_concat = tf.concat([spatial_avg, spatial_max], axis=-1)
+        spatial_attention = self.spatial_conv(spatial_concat)
+        
+        return x * spatial_attention
+
+class AdvancedMultiTaskModel:
+    """Advanced multi-task model with custom architecture and training strategies"""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.strategy = self._setup_strategy()
+        
+    def _setup_strategy(self):
+        """Setup training strategy (multi-GPU, TPU, etc.)"""
+        try:
+            if self.config.USE_MULTI_GPU and len(tf.config.experimental.list_physical_devices('GPU')) > 1:
+                return tf.distribute.MirroredStrategy()
+            else:
+                return tf.distribute.get_strategy()
+        except:
+            return tf.distribute.get_strategy()
+    
+    def build_advanced_backbone(self, inputs):
+        """Build advanced backbone with optional model types"""
+        if self.config.MODEL_TYPE == 'efficientnet_b0':
+            base_model = EfficientNetB0(
+                include_top=False,
+                weights='imagenet',
+                input_tensor=inputs,
+                pooling=None
+            )
+        elif self.config.MODEL_TYPE == 'efficientnet_b3':
+            base_model = EfficientNetB3(
+                include_top=False,
+                weights='imagenet',
+                input_tensor=inputs,
+                pooling=None
+            )
+        else:
+            # Custom backbone
+            x = tf.keras.layers.Conv2D(32, 3, activation='relu', padding='same')(inputs)
+            x = tf.keras.layers.Conv2D(64, 3, activation='relu', padding='same')(x)
+            x = tf.keras.layers.MaxPooling2D()(x)
+            x = AttentionModule()(x)
+            base_model = Model(inputs=inputs, outputs=x)
+        
+        # Fine-tuning strategy
+        if hasattr(base_model, 'layers'):
+            for layer in base_model.layers[:100]:
+                layer.trainable = False
+                
         return base_model
     
-    def build_multi_task_model(self):
-        """Build multi-task model predicting both age and gender"""
-        base_model = self.build_base_model()
-        
-        # Shared layers
-        x = base_model.output
-        x = Dense(1024, activation='relu')(x)
-        x = Dropout(0.5)(x)
-        x = BatchNormalization()(x)
-        
-        # Age prediction branch (regression)
-        age_branch = Dense(512, activation='relu')(x)
-        age_branch = Dropout(0.3)(age_branch)
-        age_output = Dense(1, activation='linear', name='age_output')(age_branch)
-        
-        # Gender prediction branch (classification)
-        gender_branch = Dense(512, activation='relu')(x)
-        gender_branch = Dropout(0.3)(gender_branch)
-        gender_output = Dense(1, activation='sigmoid', name='gender_output')(gender_branch)
-        
-        model = Model(
-            inputs=base_model.input,
-            outputs=[age_output, gender_output],
-            name='multi_task_model'
-        )
-        
+    def build_advanced_model(self):
+        """Build advanced multi-task model with attention and custom heads"""
+        with self.strategy.scope():
+            inputs = Input(shape=(*self.config.IMG_SIZE, 3))
+            
+            # Backbone
+            backbone = self.build_advanced_backbone(inputs)
+            x = backbone.output
+            
+            # Attention mechanism
+            x = AttentionModule()(x)
+            x = GlobalAveragePooling2D()(x)
+            
+            # Shared dense layers
+            x = Dense(1024, activation='relu', kernel_regularizer=l2(0.001))(x)
+            x = Dropout(0.5)(x)
+            x = BatchNormalization()(x)
+            
+            x = Dense(512, activation='relu', kernel_regularizer=l2(0.001))(x)
+            x = Dropout(0.3)(x)
+            x = BatchNormalization()(x)
+            
+            # Age prediction branch (regression + classification)
+            age_shared = Dense(256, activation='relu')(x)
+            age_shared = Dropout(0.2)(age_shared)
+            
+            # Regression head
+            age_regression = Dense(128, activation='relu')(age_shared)
+            age_regression = Dense(64, activation='relu')(age_regression)
+            age_output_reg = Dense(1, activation='linear', name='age_output_reg')(age_regression)
+            
+            # Classification head
+            age_classification = Dense(128, activation='relu')(age_shared)
+            age_classification = Dense(64, activation='relu')(age_classification)
+            age_output_cls = Dense(self.config.NUM_CLASSES_AGE, activation='softmax', 
+                                 name='age_output_cls')(age_classification)
+            
+            # Gender prediction branch
+            gender_branch = Dense(256, activation='relu')(x)
+            gender_branch = Dropout(0.2)(gender_branch)
+            gender_branch = Dense(128, activation='relu')(gender_branch)
+            gender_output = Dense(1, activation='sigmoid', name='gender_output')(gender_branch)
+            
+            model = Model(
+                inputs=inputs,
+                outputs=[age_output_reg, age_output_cls, gender_output],
+                name='advanced_multi_task_model'
+            )
+            
         return model
     
-    def compile_model(self, model):
-        """Compile model with custom loss weights"""
-        model.compile(
-            optimizer=Adam(learning_rate=LEARNING_RATE),
-            loss={
-                'age_output': 'mse',
-                'gender_output': 'binary_crossentropy'
-            },
-            loss_weights={
-                'age_output': 0.5,
-                'gender_output': 0.5
-            },
-            metrics={
-                'age_output': ['mae'],
-                'gender_output': ['accuracy']
+    def compile_advanced_model(self, model):
+        """Compile model with custom loss functions and metrics"""
+        with self.strategy.scope():
+            # Custom loss weights
+            loss_weights = {
+                'age_output_reg': 0.4,
+                'age_output_cls': 0.3,
+                'gender_output': 0.3
             }
-        )
+            
+            # Custom metrics
+            metrics_dict = {
+                'age_output_reg': ['mae', 'mse'],
+                'age_output_cls': ['accuracy'],
+                'gender_output': ['accuracy', 'precision', 'recall']
+            }
+            
+            model.compile(
+                optimizer=Adam(learning_rate=self.config.LEARNING_RATE),
+                loss={
+                    'age_output_reg': 'huber_loss',  # More robust than MSE
+                    'age_output_cls': 'categorical_crossentropy',
+                    'gender_output': 'binary_crossentropy'
+                },
+                loss_weights=loss_weights,
+                metrics=metrics_dict
+            )
         return model
     
-    def get_callbacks(self):
-        """Define training callbacks"""
-        return [
-            EarlyStopping(monitor='val_loss', patience=PATIENCE),
-            ReduceLROnPlateau(monitor='val_loss', factor=0.1, patience=PATIENCE//2),
+    def get_advanced_callbacks(self):
+        """Advanced callbacks for training"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_dir = f"./logs/{timestamp}"
+        
+        callbacks = [
+            EarlyStopping(
+                monitor='val_loss',
+                patience=self.config.PATIENCE,
+                restore_best_weights=True,
+                verbose=1
+            ),
+            ReduceLROnPlateau(
+                monitor='val_loss',
+                factor=0.2,
+                patience=self.config.PATIENCE // 2,
+                min_lr=1e-7,
+                verbose=1
+            ),
             ModelCheckpoint(
-                'best_model.h5',
+                f'best_model_{timestamp}.h5',
                 monitor='val_loss',
                 save_best_only=True,
-                save_weights_only=False
+                save_weights_only=False,
+                mode='min',
+                verbose=1
             ),
-            TensorBoard(log_dir='./logs')
+            TensorBoard(
+                log_dir=log_dir,
+                histogram_freq=1,
+                write_graph=True,
+                write_images=True
+            ),
+            CSVLogger(f'training_log_{timestamp}.csv'),
+            LearningRateScheduler(self._cosine_annealing)
         ]
+        
+        return callbacks
+    
+    def _cosine_annealing(self, epoch, lr):
+        """Cosine annealing learning rate scheduler"""
+        if epoch < 10:
+            return lr
+        cos_inner = np.pi * (epoch % self.config.EPOCHS) / self.config.EPOCHS
+        return self.config.LEARNING_RATE / 2 * (np.cos(cos_inner) + 1)
 
-class ModelEvaluator:
+class CrossValidationTrainer:
+    """Advanced cross-validation trainer"""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.fold_histories = []
+        self.fold_models = []
+    
+    def perform_cross_validation(self, images, ages, genders):
+        """Perform k-fold cross validation"""
+        skf = StratifiedKFold(n_splits=self.config.NUM_FOLDS, shuffle=True, random_state=42)
+        
+        for fold, (train_idx, val_idx) in enumerate(skf.split(images, genders)):
+            logging.info(f"Training fold {fold + 1}/{self.config.NUM_FOLDS}")
+            
+            x_train, x_val = images[train_idx], images[val_idx]
+            y_train_age, y_val_age = ages[train_idx], ages[val_idx]
+            y_train_gender, y_val_gender = genders[train_idx], genders[val_idx]
+            
+            # Create age bins for classification
+            processor = AdvancedDataProcessor(self.config)
+            processor.ages = y_train_age
+            y_train_age_cls = processor.create_age_bins()
+            
+            processor.ages = y_val_age
+            y_val_age_cls = processor.create_age_bins()
+            
+            # Build and train model
+            model_builder = AdvancedMultiTaskModel(self.config)
+            model = model_builder.build_advanced_model()
+            model = model_builder.compile_advanced_model(model)
+            
+            history = model.fit(
+                x_train,
+                {
+                    'age_output_reg': y_train_age,
+                    'age_output_cls': y_train_age_cls,
+                    'gender_output': y_train_gender
+                },
+                validation_data=(
+                    x_val,
+                    {
+                        'age_output_reg': y_val_age,
+                        'age_output_cls': y_val_age_cls,
+                        'gender_output': y_val_gender
+                    }
+                ),
+                batch_size=self.config.BATCH_SIZE,
+                epochs=self.config.EPOCHS,
+                callbacks=model_builder.get_advanced_callbacks(),
+                verbose=1
+            )
+            
+            self.fold_histories.append(history)
+            self.fold_models.append(model)
+            
+        return self.fold_histories, self.fold_models
+
+class AdvancedModelEvaluator:
+    """Comprehensive model evaluation with advanced metrics"""
+    
     @staticmethod
-    def plot_history(history):
-        """Plot training history for all metrics"""
-        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-        
-        # Age metrics
-        axes[0, 0].plot(history.history['age_output_loss'], label='Train')
-        axes[0, 0].plot(history.history['val_age_output_loss'], label='Validation')
-        axes[0, 0].set_title('Age Loss (MSE)')
-        axes[0, 0].legend()
-        
-        axes[0, 1].plot(history.history['age_output_mae'], label='Train')
-        axes[0, 1].plot(history.history['val_age_output_mae'], label='Validation')
-        axes[0, 1].set_title('Age MAE')
-        axes[0, 1].legend()
-        
-        # Gender metrics
-        axes[1, 0].plot(history.history['gender_output_loss'], label='Train')
-        axes[1, 0].plot(history.history['val_gender_output_loss'], label='Validation')
-        axes[1, 0].set_title('Gender Loss')
-        axes[1, 0].legend()
-        
-        axes[1, 1].plot(history.history['gender_output_accuracy'], label='Train')
-        axes[1, 1].plot(history.history['val_gender_output_accuracy'], label='Validation')
-        axes[1, 1].set_title('Gender Accuracy')
-        axes[1, 1].legend()
+    def plot_comprehensive_analysis(history, fold_histories=None):
+        """Create comprehensive visualization of training history"""
+        if fold_histories:
+            fig, axes = plt.subplots(3, 3, figsize=(20, 15))
+            
+            for i, fold_history in enumerate(fold_histories):
+                # Age regression metrics
+                axes[0, 0].plot(fold_history.history['age_output_reg_loss'], 
+                               alpha=0.7, label=f'Fold {i+1}')
+                axes[0, 1].plot(fold_history.history['age_output_reg_mae'], 
+                               alpha=0.7, label=f'Fold {i+1}')
+                
+                # Age classification metrics
+                axes[1, 0].plot(fold_history.history['age_output_cls_loss'], 
+                               alpha=0.7, label=f'Fold {i+1}')
+                axes[1, 1].plot(fold_history.history['age_output_cls_accuracy'], 
+                               alpha=0.7, label=f'Fold {i+1}')
+                
+                # Gender metrics
+                axes[2, 0].plot(fold_history.history['gender_output_loss'], 
+                               alpha=0.7, label=f'Fold {i+1}')
+                axes[2, 1].plot(fold_history.history['gender_output_accuracy'], 
+                               alpha=0.7, label=f'Fold {i+1}')
+            
+            # Add validation metrics
+            for i, fold_history in enumerate(fold_histories):
+                axes[0, 2].plot(fold_history.history['val_age_output_reg_mae'], 
+                               alpha=0.7, label=f'Fold {i+1}')
+                axes[1, 2].plot(fold_history.history['val_age_output_cls_accuracy'], 
+                               alpha=0.7, label=f'Fold {i+1}')
+                axes[2, 2].plot(fold_history.history['val_gender_output_accuracy'], 
+                               alpha=0.7, label=f'Fold {i+1}')
+        else:
+            fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+            
+            # Training metrics
+            metrics_to_plot = [
+                ('age_output_reg_loss', 'Age Regression Loss'),
+                ('age_output_reg_mae', 'Age MAE'),
+                ('age_output_cls_accuracy', 'Age Classification Accuracy'),
+                ('gender_output_loss', 'Gender Loss'),
+                ('gender_output_accuracy', 'Gender Accuracy')
+            ]
+            
+            for idx, (metric, title) in enumerate(metrics_to_plot):
+                ax = axes[idx // 3, idx % 3]
+                ax.plot(history.history[metric], label='Train')
+                ax.plot(history.history[f'val_{metric}'], label='Validation')
+                ax.set_title(title)
+                ax.legend()
+                ax.grid(True)
         
         plt.tight_layout()
+        plt.savefig('training_analysis.png', dpi=300, bbox_inches='tight')
         plt.show()
     
     @staticmethod
-    def evaluate_model(model, x_test, y_test_age, y_test_gender):
-        """Evaluate model performance"""
+    def comprehensive_evaluation(model, x_test, y_test_age, y_test_gender, config):
+        """Perform comprehensive model evaluation"""
         # Predictions
-        age_pred, gender_pred = model.predict(x_test)
-        gender_pred = (gender_pred > 0.5).astype(int)
+        age_pred_reg, age_pred_cls, gender_pred = model.predict(x_test)
+        gender_pred_binary = (gender_pred > 0.5).astype(int)
         
         # Age evaluation
-        age_mae = metrics.mean_absolute_error(y_test_age, age_pred)
-        print(f"Age MAE: {age_mae:.2f} years")
+        age_mae = metrics.mean_absolute_error(y_test_age, age_pred_reg)
+        age_mse = metrics.mean_squared_error(y_test_age, age_pred_reg)
+        age_r2 = metrics.r2_score(y_test_age, age_pred_reg)
+        
+        print("=== AGE EVALUATION ===")
+        print(f"MAE: {age_mae:.2f} years")
+        print(f"MSE: {age_mse:.2f}")
+        print(f"R² Score: {age_r2:.4f}")
         
         # Gender evaluation
-        gender_acc = metrics.accuracy_score(y_test_gender, gender_pred)
-        print(f"Gender Accuracy: {gender_acc:.4f}")
-        print("\nClassification Report:")
-        print(classification_report(y_test_gender, gender_pred))
+        gender_accuracy = metrics.accuracy_score(y_test_gender, gender_pred_binary)
+        gender_precision = metrics.precision_score(y_test_gender, gender_pred_binary)
+        gender_recall = metrics.recall_score(y_test_gender, gender_pred_binary)
+        gender_f1 = metrics.f1_score(y_test_gender, gender_pred_binary)
+        
+        print("\n=== GENDER EVALUATION ===")
+        print(f"Accuracy: {gender_accuracy:.4f}")
+        print(f"Precision: {gender_precision:.4f}")
+        print(f"Recall: {gender_recall:.4f}")
+        print(f"F1-Score: {gender_f1:.4f}")
+        
+        # Detailed classification report
+        print("\n=== DETAILED CLASSIFICATION REPORT ===")
+        print(classification_report(y_test_gender, gender_pred_binary, 
+                                  target_names=['Female', 'Male']))
         
         # Confusion matrix
-        cm = confusion_matrix(y_test_gender, gender_pred)
-        plt.figure(figsize=(6, 6))
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
+        plt.figure(figsize=(10, 4))
+        
+        plt.subplot(1, 2, 1)
+        cm = confusion_matrix(y_test_gender, gender_pred_binary)
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                   xticklabels=['Female', 'Male'], 
+                   yticklabels=['Female', 'Male'])
         plt.title('Gender Confusion Matrix')
         plt.xlabel('Predicted')
         plt.ylabel('Actual')
+        
+        # Age prediction vs actual
+        plt.subplot(1, 2, 2)
+        plt.scatter(y_test_age, age_pred_reg, alpha=0.5)
+        plt.plot([y_test_age.min(), y_test_age.max()], 
+                [y_test_age.min(), y_test_age.max()], 'r--', lw=2)
+        plt.xlabel('Actual Age')
+        plt.ylabel('Predicted Age')
+        plt.title(f'Age Prediction (MAE: {age_mae:.2f} years)')
+        
+        plt.tight_layout()
+        plt.savefig('model_evaluation.png', dpi=300, bbox_inches='tight')
         plt.show()
+        
+        return {
+            'age_mae': age_mae,
+            'age_mse': age_mse,
+            'age_r2': age_r2,
+            'gender_accuracy': gender_accuracy,
+            'gender_precision': gender_precision,
+            'gender_recall': gender_recall,
+            'gender_f1': gender_f1
+        }
+
+def setup_logging():
+    """Setup comprehensive logging"""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler('training.log'),
+            logging.StreamHandler()
+        ]
+    )
 
 def main():
-    # Initialize and load data
-    data_processor = DataProcessor("UTKFace/UTKFace")
-    images, ages, genders = data_processor.load_data()
+    """Main execution function"""
+    setup_logging()
     
-    # Split data
-    x_train, x_test, y_train_age, y_test_age, y_train_gender, y_test_gender = train_test_split(
-        images, ages, genders, test_size=0.2, random_state=42, stratify=genders
-    )
+    # Configuration
+    config = Config()
     
-    # Build and train model
-    model_builder = MultiTaskModel(input_shape=(*IMG_SIZE, 3))
-    model = model_builder.build_multi_task_model()
-    model = model_builder.compile_model(model)
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Advanced Multi-task Age and Gender Prediction')
+    parser.add_argument('--data_path', type=str, default='UTKFace/UTKFace', 
+                       help='Path to dataset directory')
+    parser.add_argument('--use_cross_validation', action='store_true',
+                       help='Use k-fold cross validation')
+    parser.add_argument('--model_type', type=str, default='efficientnet_b3',
+                       choices=['efficientnet_b0', 'efficientnet_b3', 'custom'],
+                       help='Model backbone type')
+    args = parser.parse_args()
     
-    print(model.summary())
+    config.MODEL_TYPE = args.model_type
     
-    # Train model
-    history = model.fit(
-        x_train,
-        {'age_output': y_train_age, 'gender_output': y_train_gender},
-        validation_data=(
-            x_test,
-            {'age_output': y_test_age, 'gender_output': y_test_gender}
-        ),
-        batch_size=BATCH_SIZE,
-        epochs=EPOCHS,
-        callbacks=model_builder.get_callbacks()
-    )
-    
-    # Evaluate model
-    evaluator = ModelEvaluator()
-    evaluator.plot_history(history)
-    
-    # Load best model and evaluate
-    best_model = tf.keras.models.load_model('best_model.h5')
-    evaluator.evaluate_model(best_model, x_test, y_test_age, y_test_gender)
+    try:
+        # Initialize and load data
+        data_processor = AdvancedDataProcessor(config)
+        images, ages, genders = data_processor.load_data(args.data_path)
+        
+        # Dataset analysis
+        analysis = data_processor.analyze_dataset()
+        logging.info(f"Dataset analysis: {analysis}")
+        
+        if args.use_cross_validation:
+            # Cross-validation training
+            cv_trainer = CrossValidationTrainer(config)
+            fold_histories, fold_models = cv_trainer.perform_cross_validation(images, ages, genders)
+            
+            # Evaluate best model from cross-validation
+            best_model_idx = np.argmin([min(h.history['val_loss']) for h in fold_histories])
+            best_model = fold_models[best_model_idx]
+            
+        else:
+            # Standard train-test split
+            x_train, x_test, y_train_age, y_test_age, y_train_gender, y_test_gender = train_test_split(
+                images, ages, genders, test_size=config.VALIDATION_SPLIT, 
+                random_state=42, stratify=genders
+            )
+            
+            # Create age classification labels
+            data_processor.ages = y_train_age
+            y_train_age_cls = data_processor.create_age_bins()
+            
+            data_processor.ages = y_test_age
+            y_test_age_cls = data_processor.create_age_bins()
+            
+            # Build and train model
+            model_builder = AdvancedMultiTaskModel(config)
+            model = model_builder.build_advanced_model()
+            model = model_builder.compile_advanced_model(model)
+            
+            logging.info("Model architecture:")
+            model.summary(print_fn=logging.info)
+            
+            # Train model
+            history = model.fit(
+                x_train,
+                {
+                    'age_output_reg': y_train_age,
+                    'age_output_cls': y_train_age_cls,
+                    'gender_output': y_train_gender
+                },
+                validation_data=(
+                    x_test,
+                    {
+                        'age_output_reg': y_test_age,
+                        'age_output_cls': y_test_age_cls,
+                        'gender_output': y_test_gender
+                    }
+                ),
+                batch_size=config.BATCH_SIZE,
+                epochs=config.EPOCHS,
+                callbacks=model_builder.get_advanced_callbacks(),
+                verbose=1
+            )
+            
+            best_model = tf.keras.models.load_model(
+                sorted(Path('.').glob('best_model_*.h5'))[-1]
+            )
+        
+        # Comprehensive evaluation
+        evaluator = AdvancedModelEvaluator()
+        
+        if args.use_cross_validation:
+            evaluator.plot_comprehensive_analysis(None, fold_histories)
+            # For CV, you might want to evaluate on a separate test set
+        else:
+            evaluator.plot_comprehensive_analysis(history)
+            results = evaluator.comprehensive_evaluation(
+                best_model, x_test, y_test_age, y_test_gender, config
+            )
+            
+            # Save results
+            with open('evaluation_results.json', 'w') as f:
+                json.dump(results, f, indent=2)
+                
+        logging.info("Training and evaluation completed successfully!")
+        
+    except Exception as e:
+        logging.error(f"Error in main execution: {str(e)}")
+        raise
 
 if __name__ == "__main__":
     main()
