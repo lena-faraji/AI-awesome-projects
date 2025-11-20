@@ -1,0 +1,419 @@
+
+from flask import Flask, render_template, request, session, flash, redirect, url_for
+import pandas as pd
+from groq import Groq
+import os
+import logging
+from typing import Tuple, Optional, Dict, Any, List
+import io
+import json
+from datetime import timedelta
+import secrets
+import tempfile
+import traceback
+
+# Configuration
+class Config:
+    SECRET_KEY = os.environ.get("SECRET_KEY", secrets.token_hex(32))
+    MAX_CONTENT_LENGTH = 16 * 1024 * 1024  # 16MB
+    PERMANENT_SESSION_LIFETIME = timedelta(hours=1)
+    SESSION_COOKIE_HTTPONLY = True
+    SESSION_COOKIE_SECURE = os.environ.get("FLASK_ENV") == "production"
+    SESSION_COOKIE_SAMESITE = "Lax"
+    UPLOAD_FOLDER = tempfile.gettempdir()
+
+app = Flask(__name__)
+app.config.from_object(Config)
+
+# Logging configuration
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+class DataAnalysisService:
+    """Service class for data analysis operations"""
+    
+    def __init__(self):
+        self.supported_formats = {'.csv', '.xlsx', '.xls', '.json'}
+        self.safe_builtins = {
+            'len', 'str', 'int', 'float', 'bool', 'list', 'dict', 'set', 'tuple',
+            'sum', 'max', 'min', 'abs', 'round', 'zip', 'range', 'enumerate',
+            'sorted', 'reversed', 'any', 'all'
+        }
+    
+    def validate_file(self, filename: str) -> Tuple[bool, str]:
+        """Validate uploaded file"""
+        if not filename:
+            return False, "No file selected"
+        
+        file_ext = os.path.splitext(filename)[1].lower()
+        if file_ext not in self.supported_formats:
+            return False, f"Unsupported file format. Supported formats: {', '.join(self.supported_formats)}"
+        
+        return True, ""
+    
+    def generate_analysis_code(self, query: str, api_key: str, df_columns: List[str] = None) -> Tuple[Optional[str], Optional[str]]:
+        """Generate analysis code using Groq API"""
+        try:
+            columns_context = f"\nAvailable columns: {', '.join(df_columns)}" if df_columns else ""
+            
+            prompt = self._build_prompt(query, columns_context)
+            
+            client = Groq(api_key=api_key)
+            chat_completion = client.chat.completions.create(
+                messages=[{"role": "user", "content": prompt}],
+                model="llama-3.3-70b-versatile",
+                temperature=0.1,
+                max_tokens=1500
+            )
+            
+            code = self._extract_code_from_response(chat_completion.choices[0].message.content)
+            return code, None
+            
+        except Exception as e:
+            logger.error(f"Groq API error: {str(e)}")
+            return None, f"API Error: {str(e)}"
+    
+    def _build_prompt(self, query: str, columns_context: str) -> str:
+        """Build the prompt for code generation"""
+        return f"""
+You are a Python data analyst. Given a pandas DataFrame named `df`, write efficient and safe Python code using pandas to answer this question:
+
+Question: {query}
+{columns_context}
+
+Requirements:
+1. Return ONLY the Python code without any explanations, markdown, or additional text
+2. Use 'result' as the final output variable
+3. Use pandas best practices and efficient operations
+4. Handle potential errors gracefully
+5. Do not use any operations that could modify the original DataFrame
+6. Focus on data analysis operations like filtering, grouping, aggregation, and statistical analysis
+7. Do not use any dangerous functions like eval, exec, open, or system calls
+8. Ensure the code is memory efficient for large datasets
+
+Code:
+"""
+    
+    def _extract_code_from_response(self, response: str) -> str:
+        """Extract clean Python code from API response"""
+        code = response.strip()
+        # Remove code block markers if present
+        if code.startswith("```python"):
+            code = code.removeprefix("```python")
+        if code.endswith("```"):
+            code = code.removesuffix("```")
+        return code.strip()
+    
+    def create_safe_environment(self, df: pd.DataFrame) -> Dict[str, Any]:
+        """Create a safe execution environment for generated code"""
+        # Create restricted builtins
+        restricted_builtins = {
+            name: func for name, func in __builtins__.items() 
+            if name in self.safe_builtins
+        }
+        
+        return {
+            'pd': pd,
+            'df': df.copy(),  # Use copy to prevent modification of original
+            'result': None,
+            '__builtins__': restricted_builtins
+        }
+    
+    def execute_analysis_code(self, code: str, df: pd.DataFrame) -> Tuple[Any, Optional[str]]:
+        """Execute the generated analysis code safely"""
+        try:
+            safe_globals = self.create_safe_environment(df)
+            
+            # Add basic safety checks
+            dangerous_patterns = ['__', 'eval', 'exec', 'open', 'import os', 'import sys', 'subprocess']
+            if any(pattern in code.lower() for pattern in dangerous_patterns):
+                return None, "Code contains potentially dangerous operations"
+            
+            # Execute the code
+            exec(code, safe_globals)
+            
+            result = safe_globals.get('result')
+            if result is None:
+                return None, "No result variable found in generated code"
+                
+            return result, None
+            
+        except Exception as e:
+            logger.error(f"Code execution error: {str(e)}")
+            return None, f"Execution Error: {str(e)}"
+
+class ResultFormatter:
+    """Class for formatting analysis results"""
+    
+    @staticmethod
+    def format_result(result: Any) -> str:
+        """Format different types of analysis results as HTML"""
+        try:
+            if isinstance(result, pd.DataFrame):
+                return ResultFormatter._format_dataframe(result)
+            elif isinstance(result, pd.Series):
+                return ResultFormatter._format_series(result)
+            elif isinstance(result, (int, float, str, bool)):
+                return ResultFormatter._format_basic_type(result)
+            else:
+                return ResultFormatter._format_other_type(result)
+        except Exception as e:
+            logger.error(f"Error formatting result: {str(e)}")
+            return f"<div class='alert alert-danger'>Error formatting result: {str(e)}</div>"
+    
+    @staticmethod
+    def _format_dataframe(df: pd.DataFrame) -> str:
+        """Format DataFrame as HTML table"""
+        if df.empty:
+            return "<div class='alert alert-warning'>The result is an empty DataFrame.</div>"
+        
+        # Limit display size for large DataFrames
+        if len(df) > 1000:
+            df = df.head(1000)
+            warning = "<div class='alert alert-info'>Showing first 1000 rows (total: {})</div>".format(len(df))
+        else:
+            warning = ""
+            
+        table_html = df.to_html(
+            classes='table table-striped table-bordered table-hover table-sm', 
+            index=False,
+            escape=False,
+            na_rep=''
+        )
+        return warning + table_html
+    
+    @staticmethod
+    def _format_series(series: pd.Series) -> str:
+        """Format Series as HTML table"""
+        if series.empty:
+            return "<div class='alert alert-warning'>The result is an empty Series.</div>"
+        
+        # Limit display size for large Series
+        if len(series) > 1000:
+            series = series.head(1000)
+            warning = "<div class='alert alert-info'>Showing first 1000 rows (total: {})</div>".format(len(series))
+        else:
+            warning = ""
+            
+        table_html = series.to_frame().to_html(
+            classes='table table-striped table-bordered table-hover table-sm',
+            index=True,
+            escape=False,
+            na_rep=''
+        )
+        return warning + table_html
+    
+    @staticmethod
+    def _format_basic_type(value: Any) -> str:
+        """Format basic types with nice styling"""
+        return f"""
+        <div class="alert alert-success">
+            <h5>Analysis Result:</h5>
+            <div class="result-value p-2 bg-light rounded font-monospace">{value}</div>
+        </div>
+        """
+    
+    @staticmethod
+    def _format_other_type(result: Any) -> str:
+        """Format other types as preformatted text"""
+        return f"""
+        <div class="alert alert-info">
+            <h5>Result:</h5>
+            <pre class="p-2 bg-light rounded font-monospace">{str(result)}</pre>
+        </div>
+        """
+
+class FileProcessor:
+    """Class for processing uploaded files"""
+    
+    @staticmethod
+    def process_file(file) -> Tuple[Optional[pd.DataFrame], Optional[List[str]], Optional[str], Optional[str]]:
+        """Process uploaded file and return DataFrame, columns, HTML preview, and error"""
+        try:
+            filename = file.filename.lower()
+            
+            if filename.endswith('.csv'):
+                df = pd.read_csv(file.stream)
+            elif filename.endswith(('.xlsx', '.xls')):
+                df = pd.read_excel(file.stream)
+            elif filename.endswith('.json'):
+                df = pd.read_json(file.stream)
+            else:
+                return None, None, None, "Unsupported file format"
+            
+            # Basic data cleaning
+            df = df.dropna(how='all')  # Remove completely empty rows
+            df = df.loc[:, ~df.columns.str.contains('^Unnamed')]  # Remove unnamed columns
+            
+            # Get columns
+            columns = df.columns.tolist()
+            
+            # Generate HTML preview (limited to first 10 rows)
+            html_preview = df.head(10).to_html(
+                classes='table table-striped table-bordered table-sm',
+                index=False,
+                escape=False,
+                na_rep=''
+            )
+            
+            return df, columns, html_preview, None
+            
+        except Exception as e:
+            logger.error(f"File processing error: {str(e)}")
+            return None, None, None, f"Error processing file: {str(e)}"
+
+# Initialize services
+analysis_service = DataAnalysisService()
+result_formatter = ResultFormatter()
+file_processor = FileProcessor()
+
+@app.route("/", methods=["GET", "POST"])
+def index():
+    """Main route for the application"""
+    if request.method == "POST":
+        return handle_post_request()
+    
+    return render_template("index.html", **get_session_data())
+
+@app.route("/clear", methods=["POST"])
+def clear_session():
+    """Clear session data"""
+    session.clear()
+    flash("Session cleared successfully.", "success")
+    return redirect(url_for('index'))
+
+@app.route("/health")
+def health_check():
+    """Health check endpoint"""
+    return {"status": "healthy", "message": "Data analysis app is running"}
+
+def handle_post_request():
+    """Handle POST requests for file upload and analysis"""
+    file = request.files.get("file")
+    query = request.form.get("query", "").strip()
+    groq_key = request.form.get("api_key", "").strip()
+    
+    # Validate inputs
+    validation_error = validate_inputs(file, query, groq_key)
+    if validation_error:
+        flash(validation_error, "error")
+        return render_template("index.html", **get_session_data())
+    
+    try:
+        # Process uploaded file
+        df, cols, df_html, error = file_processor.process_file(file)
+        if error:
+            flash(f"Error processing file: {error}", "error")
+            return render_template("index.html", **get_session_data())
+        
+        # Update session with file data
+        update_session_data(cols, df)
+        
+        # Prepare response data
+        result_data = prepare_response_data(df, df_html, cols, query)
+        
+        # Perform analysis if query provided
+        if query:
+            analysis_results = perform_data_analysis(query, groq_key, df, cols)
+            result_data.update(analysis_results)
+        
+        return render_template("index.html", **result_data)
+        
+    except Exception as e:
+        logger.error(f"Unexpected error processing request: {str(e)}")
+        logger.error(traceback.format_exc())
+        flash(f"An unexpected error occurred: {str(e)}", "error")
+        return render_template("index.html", **get_session_data())
+
+def validate_inputs(file, query: str, api_key: str) -> Optional[str]:
+    """Validate all input parameters"""
+    if not api_key:
+        return "Please enter your Groq API key."
+    
+    if not file or file.filename == "":
+        return "Please select a file to upload."
+    
+    is_valid, error_msg = analysis_service.validate_file(file.filename)
+    if not is_valid:
+        return error_msg
+    
+    return None
+
+def get_session_data() -> Dict[str, Any]:
+    """Get current session data"""
+    return {
+        'file_processed': session.get('file_processed', False),
+        'df_columns': session.get('df_columns', [])
+    }
+
+def update_session_data(columns: List[str], df: pd.DataFrame):
+    """Update session with file data"""
+    session['df_columns'] = columns
+    session['file_processed'] = True
+    session['df_preview'] = df.head(10).to_dict('records')
+    session.permanent = True
+
+def prepare_response_data(df: pd.DataFrame, df_html: str, columns: List[str], query: str) -> Dict[str, Any]:
+    """Prepare base response data"""
+    return {
+        'df_html': df_html,
+        'df_preview_html': df.head().to_html(
+            classes='table table-striped table-bordered table-sm', 
+            index=False,
+            na_rep=''
+        ),
+        'code_generated': "",
+        'result_html': "",
+        'query_used': query,
+        'file_processed': True,
+        'df_columns': columns
+    }
+
+def perform_data_analysis(query: str, api_key: str, df: pd.DataFrame, df_columns: List[str]) -> Dict[str, Any]:
+    """Perform data analysis with generated code"""
+    code_generated, code_error = analysis_service.generate_analysis_code(query, api_key, df_columns)
+    if code_error:
+        flash(f"Code generation failed: {code_error}", "error")
+        return {}
+    
+    result, exec_error = analysis_service.execute_analysis_code(code_generated, df)
+    if exec_error:
+        flash(f"Code execution failed: {exec_error}", "error")
+        return {'code_generated': code_generated}
+    
+    result_html = result_formatter.format_result(result)
+    
+    return {
+        'code_generated': code_generated,
+        'result_html': result_html
+    }
+
+# Error handlers
+@app.errorhandler(413)
+def too_large(e):
+    flash("File too large. Maximum size is 16MB.", "error")
+    return redirect(url_for('index'))
+
+@app.errorhandler(500)
+def internal_error(e):
+    logger.error(f"Internal server error: {str(e)}")
+    logger.error(traceback.format_exc())
+    flash("An internal server error occurred. Please try again.", "error")
+    return redirect(url_for('index'))
+
+@app.errorhandler(404)
+def not_found(e):
+    return redirect(url_for('index'))
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    debug = os.environ.get("FLASK_ENV") == "development"
+    
+    app.run(
+        host="0.0.0.0", 
+        port=port, 
+        debug=debug
+    )
